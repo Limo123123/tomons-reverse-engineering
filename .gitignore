@@ -1,0 +1,20 @@
+# Sensible Zugangsdaten und Tokens
+secrets.md
+.*_state.json
+*.state.json
+
+# Python Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Screenshots & temporäre Bilddateien
+*.png
+
+# APK und extrahierte Binärdateien
+*.xapk
+*.bin
+extracted_arm64/
+extracted_main/
+extracted_xapk/
+scratch_research/
