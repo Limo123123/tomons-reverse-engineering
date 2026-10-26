@@ -723,6 +723,15 @@ class TomonsCharger:
         pkt_bytes = build_stop_charging_packet(session_id=self._session_counter)
         self._client.publish(self.write_topic, pkt_bytes)
 
+    @property
+    def telemetry(self) -> ChargerTelemetry:
+        """Returns the latest decoded telemetry."""
+        return self.fragment_manager.last_telemetry
+
+    def get_telemetry(self) -> ChargerTelemetry:
+        """Returns the latest decoded telemetry."""
+        return self.fragment_manager.last_telemetry
+
     @classmethod
     def from_cloud(cls, email: str, password: str, device_id: Optional[str] = None) -> "TomonsCharger":
         """
@@ -882,7 +891,7 @@ class TomonsCloudClient:
         self.token = payload.get("token")
         user = payload.get("user", {})
         user_id = user.get("id", "")
-        uid_clean = user_id.replace("-", "")[:24]
+        uid_clean = user_id.replace("-", "")[:25]
 
         self.user_info = {
             "id": user_id,
