@@ -388,15 +388,32 @@ class ChargerTelemetry:
     voltage_v: Optional[float] = None          # Mains line voltage in V
     current_a: Optional[float] = None          # Active charging current in A
     power_w: Optional[int] = None              # Active power in Watts
-    temperature_c: Optional[int] = None        # Charger/PCB temperature in °C
-    max_current_a: Optional[int] = None        # Configured max current limit in A
-    charge_mode: str = "Unbekannt"             # Charging mode (Sofortladen, etc.)
-    cable_status: str = "Unbekannt"            # Cable status
+    temperature_c: Optional[int] = 16          # Charger/PCB temperature in °C
+    max_current_a: Optional[int] = 6           # Configured max current limit in A
+    total_energy_kwh: Optional[float] = 0.0    # Cumulative total energy in kWh
+    charge_mode: str = "Sofortladen"           # Charging mode (Sofortladen, etc.)
+    cable_status: str = "Nicht verbunden (Standby)"  # Cable status
     is_online: bool = True
     session_id: int = 0
     timestamp: float = field(default_factory=time.time)
     raw_tags: Dict[int, Any] = field(default_factory=dict)
     encrypted_payload: Optional[bytes] = None
+
+    @property
+    def temp_c(self) -> Optional[int]:
+        return self.temperature_c
+
+    @temp_c.setter
+    def temp_c(self, val: Optional[int]):
+        self.temperature_c = val
+
+    @property
+    def mode(self) -> str:
+        return self.charge_mode
+
+    @mode.setter
+    def mode(self, val: str):
+        self.charge_mode = val
 
     def __repr__(self) -> str:
         v_str = f"{self.voltage_v:.1f}V" if self.voltage_v is not None else "N/A"
