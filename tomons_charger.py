@@ -514,7 +514,7 @@ class InateckFragmentManager:
             except Exception as ex:
                 logger.debug(f"Metrics unpack error: {ex}")
 
-        # 2. Current Limit: Tag 0xC20A in centi-Amperes (e.g. 0x0258 = 600 -> 6A, 0x0320 = 800 -> 8A)
+        # 2. Current Limit: Tag 0xC20A in centi-Amperes (e.g. 0x0258 = 600 -> 6A, 0x0320 = 800 -> 8A, 0x03E8 = 1000 -> 10A)
         c20a_idx = payload.find(b"\xc2\x0a")
         if c20a_idx != -1 and c20a_idx + 3 < len(payload):
             val_raw = int.from_bytes(payload[c20a_idx + 2 : c20a_idx + 4], "big")
@@ -523,17 +523,24 @@ class InateckFragmentManager:
                 self._save_cached_state()
                 updated = True
 
-        # 3. Status and State Tags (Temperature, Cable state, Charging mode)
-        # Temperature: Tag 0x2A (1 Byte in °C)
-        t_idx = payload.find(b"\x2a")
-        if t_idx != -1 and t_idx + 1 < len(payload):
-            temp = payload[t_idx + 1]
-            if 0 <= temp <= 90:
+        # 3. Status and State Tags (from authentic 53-byte status packet)
+        # Temperature: Tag 0x2A preceded specifically by c212 0000 2a
+        t_idx = payload.find(b"\xc2\x12\x00\x00\x2a")
+        if t_idx != -1 and t_idx + 5 < len(payload):
+            temp = payload[t_idx + 5]
+            if 0 <= temp <= 80:
                 self.last_telemetry.temperature_c = temp
                 updated = True
 
+        # Total Energy: Tag 0xC210 (5 Bytes)
+        e_idx = payload.find(b"\xc2\x10\x05")
+        if e_idx != -1 and e_idx + 7 < len(payload):
+            val_raw = int.from_bytes(payload[e_idx + 3 : e_idx + 8], "big")
+            self.last_telemetry.total_energy_kwh = round(val_raw / 100.0, 2)
+            updated = True
+
         # Cable state: Tag 0xC30A (01 00 = unplugged / standby)
-        c_idx = payload.find(b"\xc3\x0a")
+        c_idx = payload.find(b"\xc3\x0a\x01")
         if c_idx != -1 and c_idx + 3 < len(payload):
             val = payload[c_idx + 2 : c_idx + 4]
             if val == b"\x01\x00":
@@ -544,52 +551,14 @@ class InateckFragmentManager:
                 self.last_telemetry.cable_status = "Lädt aktiv"
             updated = True
 
-        # Charging mode: Tag 0xC314
+        # Charging mode: Tag 0xC314 (0 = Immediate, 1 = Scheduled, 2 = PV)
         m_idx = payload.find(b"\xc3\x14")
         if m_idx != -1 and m_idx + 2 < len(payload):
             m_val = payload[m_idx + 2]
             mode_map = {0x00: "Sofortladen (Immediate)", 0x01: "Geplant (Scheduled)", 0x02: "PV-Überschuss"}
-            self.last_telemetry.charge_mode = mode_map.get(m_val, f"Modus_{m_val}")
-            updated = True
-
-        # 2. Tag Stream Block (from decrypted 73-byte packet or general tags)
-        try:
-            tags = InateckTag.decode_stream(payload)
-            for t in tags:
-                self.last_telemetry.raw_tags[t.tag_id] = t.int_value
-
-                # Temperature: Tag 0x002A (1 Byte in °C)
-                if t.tag_id == TAG_TEMPERATURE:
-                    self.last_telemetry.temperature_c = t.int_value
-                    updated = True
-
-                # Current limit: Tag 0x0001 (1 Byte in A)
-                elif t.tag_id == TAG_SET_CURRENT:
-                    self.last_telemetry.max_current_a = t.int_value
-                    updated = True
-
-                # Cable status: Tag 0xC30A (01 00 = unplugged / standby)
-                elif t.tag_id == TAG_CABLE_STATE:
-                    if t.value == b"\x01\x00":
-                        self.last_telemetry.cable_status = "Nicht verbunden"
-                    elif t.value == b"\x01\x01":
-                        self.last_telemetry.cable_status = "Verbunden (Warten)"
-                    elif t.value == b"\x01\x02":
-                        self.last_telemetry.cable_status = "Lädt"
-                    updated = True
-
-                # Charging mode: Tag 0xC314
-                elif t.tag_id == TAG_CHARGE_MODE:
-                    mode_map = {0x00: "Sofortladen (Immediate)", 0x01: "Geplant (Scheduled)", 0x02: "PV-Überschuss"}
-                    self.last_telemetry.charge_mode = mode_map.get(t.int_value, f"Modus_{t.int_value}")
-                    updated = True
-
-                # Link state
-                elif t.tag_id == TAG_STATUS_CONNECTION:
-                    self.last_telemetry.is_online = (t.int_value != 0)
-                    updated = True
-        except Exception as ex:
-            logger.debug(f"Tag decode note: {ex}")
+            if m_val in mode_map:
+                self.last_telemetry.charge_mode = mode_map[m_val]
+                updated = True
 
         if updated:
             self.last_telemetry.session_id = packet.session_id
