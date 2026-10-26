@@ -821,38 +821,63 @@ class TomonsCloudClient:
     Provides automatic authentication, session token refresh, device discovery,
     and MQTT credential retrieval for Home Assistant and Python integrations.
     """
-    def __init__(self, base_url: str = API_BASE_URL):
+    def __init__(
+        self,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+        token: Optional[str] = None,
+        base_url: str = API_BASE_URL,
+    ):
         self.base_url = base_url.rstrip("/") + "/"
-        self.email: Optional[str] = None
-        self.password: Optional[str] = None
-        self.token: Optional[str] = None
+        self.email: Optional[str] = email
+        self.password: Optional[str] = password
+        self.token: Optional[str] = token.replace("Bearer ", "") if token else None
         self.user_info: Dict[str, Any] = {}
         self.devices: List[Dict[str, Any]] = []
 
-    def login(self, email: str, password: str) -> Dict[str, Any]:
+    def login(
+        self,
+        email: Optional[str] = None,
+        password: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Authenticates with cloud REST API using email and password.
         Stores JWT bearer token and userInfo containing MQTT broker credentials.
         """
         import requests
-        self.email = email
-        self.password = password
+        if email:
+            self.email = email
+        if password:
+            self.password = password
+        if not self.email or not self.password:
+            raise ValueError("Email and password must be provided to login.")
+
         url = self.base_url + "auth/login"
         resp = requests.post(url, json={
-            "account": email,
-            "password": password,
+            "account": self.email,
+            "password": self.password,
             "login_type": "EMAIL"
         }, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != 200:
-            msg = data.get("message", "Unknown error")
-            raise ValueError(f"Login failed: {msg}")
+
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+
+        if resp.status_code != 200 or data.get("code") != 200:
+            msg = data.get("message", resp.text)
+            if "账号或密码错误" in msg or "password" in msg.lower():
+                raise ValueError(f"Login fehlgeschlagen: Falsches Passwort oder ungültige E-Mail-Adresse für {self.email} ({msg})")
+            raise ValueError(f"Login fehlgeschlagen (HTTP {resp.status_code}): {msg}")
+
         payload = data.get("data", {})
         self.token = payload.get("token")
         self.user_info = payload.get("userInfo", {})
-        logger.info(f"Cloud login successful for {email}")
-        return payload
+        logger.info(f"Cloud login successful for {self.email}")
+        result = dict(self.user_info)
+        result["token"] = self.token
+        result["userInfo"] = self.user_info
+        return result
 
     def _headers(self) -> Dict[str, str]:
         if not self.token:
