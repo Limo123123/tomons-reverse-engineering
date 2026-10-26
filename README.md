@@ -3,6 +3,11 @@
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 [![Device: EV Wallbox](https://img.shields.io/badge/Hardware-AC%20EV%20Wallbox%20Charger-brightgreen.svg)]()
+[![Status: Beta](https://img.shields.io/badge/Status-Beta%20%2F%20In%20Development-yellow.svg)]()
+
+> [!WARNING]
+> ### ⚠️ BETA-STATUS / REVERSE ENGINEERING IN PROGRESS
+> Dieses Projekt befindet sich im **aktiven Beta-Stadium**. Sämtliche Implementierungen basieren auf unabhängigem Community-Reverse-Engineering der Licheng-Tech Cloud-APIs und des Wallbox-Firmware-Protokolls.
 
 Dieses Repository enthält die vollständige Dokumentation und eine native Python-Implementierung (`tomons_charger.py`) zur Steuerung und Telemetrie-Auswertung von **Tomons / Inateck Wallboxen (AC Electric Vehicle Chargers)** über das Cloud-MQTT- und REST-Protokoll.
 

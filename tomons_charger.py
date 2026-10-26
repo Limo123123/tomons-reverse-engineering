@@ -389,7 +389,7 @@ class ChargerTelemetry:
     current_a: Optional[float] = None          # Active charging current in A
     power_w: Optional[int] = None              # Active power in Watts
     temperature_c: Optional[int] = 16          # Charger/PCB temperature in °C
-    max_current_a: Optional[int] = 6           # Configured max current limit in A
+    max_current_a: Optional[int] = 16          # Configured max current limit in A (default 16A)
     total_energy_kwh: Optional[float] = 0.0    # Cumulative total energy in kWh
     charge_mode: str = "Sofortladen"           # Charging mode (Sofortladen, etc.)
     cable_status: str = "Nicht verbunden (Standby)"  # Cable status
@@ -589,7 +589,8 @@ class TomonsCharger:
         self.user = user
         self.password = password
         self.device_id = device_id
-        self.client_id = client_id or f"app_{device_id[:8]}"
+        # Use dedicated Home Assistant client id to avoid kicking off mobile app or test scripts
+        self.client_id = client_id or f"ha_{device_id[:8]}_{int(time.time()) & 0xFFFF}"
 
         self.write_topic = f"device/{self.device_id}/send"
         self.read_topic = f"device/{self.device_id}/receive"
@@ -600,6 +601,11 @@ class TomonsCharger:
             self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
         except AttributeError:
             self._client = mqtt.Client(client_id=self.client_id)
+
+        try:
+            self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+        except Exception:
+            pass
 
         if self.user:
             self._client.username_pw_set(self.user, self.password)
@@ -674,6 +680,13 @@ class TomonsCharger:
         self._client.loop_stop()
         self._client.disconnect()
         self.is_connected = False
+
+    def reconnect(self):
+        """Attempts reconnect to MQTT broker."""
+        try:
+            self._client.reconnect()
+        except Exception as ex:
+            logger.debug(f"Reconnect attempt error: {ex}")
 
     def publish_packet(self, packet: InateckPacket, topic: Optional[str] = None):
         """Publishes an InateckPacket to the wallbox."""
