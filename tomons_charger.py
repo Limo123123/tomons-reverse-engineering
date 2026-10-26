@@ -842,9 +842,11 @@ class TomonsCloudClient:
     ) -> Dict[str, Any]:
         """
         Authenticates with cloud REST API using email and password.
+        The Licheng API requires the password to be MD5-hashed (lowercase).
         Stores JWT bearer token and userInfo containing MQTT broker credentials.
         """
         import requests
+        import hashlib
         if email:
             self.email = email
         if password:
@@ -852,10 +854,16 @@ class TomonsCloudClient:
         if not self.email or not self.password:
             raise ValueError("Email and password must be provided to login.")
 
+        # Licheng REST API requires the password to be MD5-hashed
+        if len(self.password) == 32 and all(c in "0123456789abcdef" for c in self.password.lower()):
+            pwd_hash = self.password.lower()
+        else:
+            pwd_hash = hashlib.md5(self.password.encode("utf-8")).hexdigest().lower()
+
         url = self.base_url + "auth/login"
         resp = requests.post(url, json={
             "account": self.email,
-            "password": self.password,
+            "password": pwd_hash,
             "login_type": "EMAIL"
         }, timeout=10)
 
@@ -872,7 +880,19 @@ class TomonsCloudClient:
 
         payload = data.get("data", {})
         self.token = payload.get("token")
-        self.user_info = payload.get("userInfo", {})
+        user = payload.get("user", {})
+        user_id = user.get("id", "")
+        uid_clean = user_id.replace("-", "")[:24]
+
+        self.user_info = {
+            "id": user_id,
+            "account": user.get("account", self.email),
+            "token": self.token,
+            "mqttBroker": DEFAULT_MQTT_BROKER,
+            "mqttPort": DEFAULT_MQTT_PORT,
+            "mqttUsername": f"user_{uid_clean}" if uid_clean else "",
+            "mqttPassword": self.user_info.get("mqttPassword") or "7932f254d3c375e9ff9e7d9b460e0116"
+        }
         logger.info(f"Cloud login successful for {self.email}")
         result = dict(self.user_info)
         result["token"] = self.token
