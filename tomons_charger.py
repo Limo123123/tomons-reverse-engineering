@@ -391,6 +391,7 @@ class ChargerTelemetry:
     temperature_c: Optional[int] = 16          # Charger/PCB temperature in °C
     max_current_a: Optional[int] = 16          # Configured max current limit in A (default 16A)
     total_energy_kwh: Optional[float] = 0.0    # Cumulative total energy in kWh
+    hardware_session_energy_kwh: Optional[float] = None  # Metered session energy in kWh
     charge_mode: str = "Sofortladen"           # Charging mode (Sofortladen, etc.)
     cable_status: str = "Nicht verbunden (Standby)"  # Cable status
     is_online: bool = True
@@ -477,93 +478,60 @@ class InateckFragmentManager:
         if payload.startswith(b"\x53\x79"):
             return None
 
-        # 1. Electrical Metrics Tag 0xC302 (Voltage, Current, Power)
+        # 1. Electrical Metrics Tag 0xC302 (Voltage, Current, Power, Session Data)
         # Format: c3 02 [length >= 0x0e]
         # Data contains 7 uint16 words (14 bytes):
-        # u0, u1, u2: Phase currents (in 0.01 A) L1, L2, L3
-        # u3: Supply / line voltage (in 0.1 V, e.g. 3827 = 382.7 V)
-        # u4, u5, u6: Phase powers / active power (in W)
+        # Word 0: Reserved (0x0000)
+        # Word 1: Session Duration / Timer (in seconds)
+        # Word 2: Reserved (0x0000)
+        # Word 3: Grid / Line Voltage (in 0.1 V, e.g. 3791 = 379.1 V, 2300 = 230.0 V)
+        # Word 4: Active Charging Current (in 0.01 A, e.g. 0 = 0.00 A, 1600 = 16.00 A)
+        # Word 5: Active Charging Power (in Watts, e.g. 0 = 0 W, 11000 = 11000 W)
+        # Word 6: Hardware-Metered Session Energy (uint16 little-endian, in 0.01 kWh, e.g. 0x0019 = 25 -> 0.25 kWh)
         m_idx = payload.find(b"\xc3\x02")
         if m_idx != -1 and m_idx + 2 < len(payload):
             tag_len = payload[m_idx + 2]
             if tag_len >= 14 and m_idx + 3 + 14 <= len(payload):
                 try:
                     data_start = m_idx + 3
-                    u = [
-                        int.from_bytes(payload[data_start + i * 2 : data_start + (i + 1) * 2], "big")
-                        for i in range(7)
-                    ]
-                    # u[0]: Phase 1 current (0.01 A)
-                    # u[1]: Phase 2 current (0.01 A)
-                    # u[2]: Phase 3 current (0.01 A)
-                    # u[3]: Line / Supply Voltage (0.1 V)
-                    # u[4]: Phase 1 power or current (W or 0.01A)
-                    # u[5]: Phase 2 power (W)
-                    # u[6]: Phase 3 power or Total active power (W)
 
-                    # Voltage:
-                    if 1000 <= u[3] <= 5000:
-                        self.last_telemetry.voltage_v = round(u[3] / 10.0, 1)
-                        updated = True
-                    elif 1000 <= u[0] <= 5000 and u[3] < 1000:
-                        self.last_telemetry.voltage_v = round(u[0] / 10.0, 1)
+                    # Word 3: Grid / Supply Voltage
+                    v_raw = int.from_bytes(payload[data_start + 6 : data_start + 8], "big")
+                    if 1000 <= v_raw <= 5000:
+                        self.last_telemetry.voltage_v = round(v_raw / 10.0, 1)
                         updated = True
 
-                    # Currents:
-                    # Phase currents in centi-Amperes (50 = 0.50A to 3500 = 35.00A)
-                    phase_currents = [x for x in (u[0], u[1], u[2]) if 50 <= x <= 3500]
-                    # Fallback check on u[4] if u[0..2] were 0 and u[4] is in plausible current range
-                    if not phase_currents and 50 <= u[4] <= 3500 and u[5] == 0:
-                        phase_currents = [u[4]]
-
-                    if phase_currents:
-                        self.last_telemetry.current_a = round(max(phase_currents) / 100.0, 2)
-                        updated = True
-                    elif all(x == 0 for x in (u[0], u[1], u[2], u[4])):
-                        self.last_telemetry.current_a = 0.0
+                    # Word 4: Active Current (in 0.01 A)
+                    i_raw = int.from_bytes(payload[data_start + 8 : data_start + 10], "big")
+                    if 0 <= i_raw <= 5000:
+                        self.last_telemetry.current_a = round(i_raw / 100.0, 2)
                         updated = True
 
-                    # Power:
-                    # Check u[4], u[5], u[6]
-                    p_cands = [u[4], u[5], u[6]]
-                    if u[6] > 50 and u[6] >= (u[4] + u[5]):
-                        # u[6] is total active power
-                        self.last_telemetry.power_w = u[6]
+                    # Word 5: Active Power (in Watts)
+                    p_raw = int.from_bytes(payload[data_start + 10 : data_start + 12], "big")
+                    if 0 <= p_raw <= 35000:
+                        self.last_telemetry.power_w = p_raw
                         updated = True
-                    elif u[4] > 50 and u[5] > 50:
-                        # Sum of phase powers
-                        self.last_telemetry.power_w = u[4] + u[5] + u[6]
-                        updated = True
-                    elif max(p_cands) > 50:
-                        self.last_telemetry.power_w = max(p_cands)
-                        updated = True
-                    elif all(x == 0 for x in p_cands):
-                        # Both direct power and phase powers are 0
-                        # Derive power from current and voltage if current is flowing
-                        if self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5:
-                            v = self.last_telemetry.voltage_v or 230.0
-                            n_phases = len(phase_currents) if phase_currents else 3
-                            v_phase = (v / 1.73205) if v > 300 else v
-                            if phase_currents:
-                                derived_w = round(v_phase * sum(x / 100.0 for x in phase_currents))
-                            else:
-                                derived_w = round(v_phase * n_phases * self.last_telemetry.current_a)
-                            self.last_telemetry.power_w = derived_w
-                            updated = True
-                        else:
-                            self.last_telemetry.power_w = 0
-                            updated = True
 
-                    # Reverse derivation: if power > 50 but current was 0
-                    if self.last_telemetry.power_w and self.last_telemetry.power_w > 50:
-                        if not self.last_telemetry.current_a or self.last_telemetry.current_a <= 0.0:
-                            v = self.last_telemetry.voltage_v or 230.0
-                            v_phase = (v / 1.73205) if v > 300 else v
-                            if v > 300:
-                                self.last_telemetry.current_a = round(self.last_telemetry.power_w / (v_phase * 3.0), 2)
-                            else:
-                                self.last_telemetry.current_a = round(self.last_telemetry.power_w / v_phase, 2)
-                            updated = True
+                    # Word 6: Hardware-metered last session energy (uint16 little-endian)
+                    e_raw = int.from_bytes(payload[data_start + 12 : data_start + 14], "little")
+                    if 0 < e_raw < 10000:
+                        self.last_telemetry.hardware_session_energy_kwh = round(e_raw / 100.0, 2)
+
+                    # Physical cross-derivation if charging
+                    if self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5 and self.last_telemetry.power_w == 0:
+                        v = self.last_telemetry.voltage_v or 230.0
+                        v_phase = (v / 1.73205) if v > 300 else v
+                        n_phases = 3 if v > 300 else 1
+                        self.last_telemetry.power_w = round(v_phase * n_phases * self.last_telemetry.current_a)
+                        updated = True
+
+                    if self.last_telemetry.power_w and self.last_telemetry.power_w > 50 and (not self.last_telemetry.current_a or self.last_telemetry.current_a <= 0.0):
+                        v = self.last_telemetry.voltage_v or 230.0
+                        v_phase = (v / 1.73205) if v > 300 else v
+                        n_phases = 3 if v > 300 else 1
+                        self.last_telemetry.current_a = round(self.last_telemetry.power_w / (v_phase * n_phases), 2)
+                        updated = True
 
                 except Exception as ex:
                     logger.debug(f"Metrics unpack error: {ex}")
@@ -610,9 +578,14 @@ class InateckFragmentManager:
                     self.last_telemetry.cable_status = status_map[status_code]
                     updated = True
 
-        # Physical override: If current is flowing (> 0.5 A) or active power is high (> 50 W),
-        # the EV cable is physically plugged in and charging regardless of what status tag reported.
-        if (self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5) or (self.last_telemetry.power_w and self.last_telemetry.power_w > 50):
+                # When unplugged, force zero current and power
+                if status_code == 0x00:
+                    self.last_telemetry.current_a = 0.0
+                    self.last_telemetry.power_w = 0
+
+        # Physical override: ONLY when cable is NOT disconnected:
+        # If current (> 1.0 A) and power (> 200 W) are actively flowing, promote to "Lädt aktiv"
+        if (self.last_telemetry.current_a and self.last_telemetry.current_a > 1.0) and (self.last_telemetry.power_w and self.last_telemetry.power_w > 200):
             self.last_telemetry.cable_status = "Lädt aktiv"
             updated = True
 
@@ -770,7 +743,9 @@ class TomonsCharger:
         """Sets max charging current (e.g. 6, 8, 10, 13, 16, 20, 24, 32 A)."""
         self._session_counter = (self._session_counter + 1) & 0xFF
         pkt_bytes = build_set_charge_current_packet(current_amps, session_id=self._session_counter)
-        self._client.publish(self.write_topic, pkt_bytes)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
+        time.sleep(0.08)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
         # Update local telemetry and persist cached state
         self.fragment_manager.last_telemetry.max_current_a = current_amps
         self.fragment_manager._save_cached_state()
@@ -779,13 +754,17 @@ class TomonsCharger:
         """Sends command to start charging."""
         self._session_counter = (self._session_counter + 1) & 0xFF
         pkt_bytes = build_start_charging_packet(session_id=self._session_counter)
-        self._client.publish(self.write_topic, pkt_bytes)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
+        time.sleep(0.08)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
 
     def stop_charging(self):
         """Sends command to stop charging."""
         self._session_counter = (self._session_counter + 1) & 0xFF
         pkt_bytes = build_stop_charging_packet(session_id=self._session_counter)
-        self._client.publish(self.write_topic, pkt_bytes)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
+        time.sleep(0.08)
+        self._client.publish(self.write_topic, pkt_bytes, qos=1)
 
     @property
     def telemetry(self) -> ChargerTelemetry:
