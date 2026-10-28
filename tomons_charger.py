@@ -478,41 +478,95 @@ class InateckFragmentManager:
             return None
 
         # 1. Electrical Metrics Tag 0xC302 (Voltage, Current, Power)
-        # Format: c3 02 0e [6 zero bytes] [Voltage 2B in 0.1V] [Current 2B in 0.01A] [Power 2B in W]
-        m_idx = payload.find(b"\xc3\x02\x0e")
-        if m_idx != -1 and m_idx + 15 < len(payload):
-            try:
-                v_raw = int.from_bytes(payload[m_idx + 9 : m_idx + 11], "big")
-                if 1000 <= v_raw <= 5000:
-                    self.last_telemetry.voltage_v = round(v_raw / 10.0, 1)
-                    updated = True
+        # Format: c3 02 [length >= 0x0e]
+        # Data contains 7 uint16 words (14 bytes):
+        # u0, u1, u2: Phase currents (in 0.01 A) L1, L2, L3
+        # u3: Supply / line voltage (in 0.1 V, e.g. 3827 = 382.7 V)
+        # u4, u5, u6: Phase powers / active power (in W)
+        m_idx = payload.find(b"\xc3\x02")
+        if m_idx != -1 and m_idx + 2 < len(payload):
+            tag_len = payload[m_idx + 2]
+            if tag_len >= 14 and m_idx + 3 + 14 <= len(payload):
+                try:
+                    data_start = m_idx + 3
+                    u = [
+                        int.from_bytes(payload[data_start + i * 2 : data_start + (i + 1) * 2], "big")
+                        for i in range(7)
+                    ]
+                    # u[0]: Phase 1 current (0.01 A)
+                    # u[1]: Phase 2 current (0.01 A)
+                    # u[2]: Phase 3 current (0.01 A)
+                    # u[3]: Line / Supply Voltage (0.1 V)
+                    # u[4]: Phase 1 power or current (W or 0.01A)
+                    # u[5]: Phase 2 power (W)
+                    # u[6]: Phase 3 power or Total active power (W)
 
-                i_raw = int.from_bytes(payload[m_idx + 11 : m_idx + 13], "big")
-                self.last_telemetry.current_a = round(i_raw / 100.0, 2)
+                    # Voltage:
+                    if 1000 <= u[3] <= 5000:
+                        self.last_telemetry.voltage_v = round(u[3] / 10.0, 1)
+                        updated = True
+                    elif 1000 <= u[0] <= 5000 and u[3] < 1000:
+                        self.last_telemetry.voltage_v = round(u[0] / 10.0, 1)
+                        updated = True
 
-                p_raw = int.from_bytes(payload[m_idx + 13 : m_idx + 15], "big")
-                self.last_telemetry.power_w = p_raw
-                updated = True
-            except Exception as ex:
-                logger.debug(f"Metrics unpack error: {ex}")
-        elif len(payload) == 22:
-            try:
-                # Voltage at offset 14 (0x0e): Uint16 in tenths of a Volt (e.g. 3827 = 382.7 V)
-                v_raw = int.from_bytes(payload[14:16], "big")
-                if 1000 <= v_raw <= 5000:
-                    self.last_telemetry.voltage_v = round(v_raw / 10.0, 1)
-                    updated = True
+                    # Currents:
+                    # Phase currents in centi-Amperes (50 = 0.50A to 3500 = 35.00A)
+                    phase_currents = [x for x in (u[0], u[1], u[2]) if 50 <= x <= 3500]
+                    # Fallback check on u[4] if u[0..2] were 0 and u[4] is in plausible current range
+                    if not phase_currents and 50 <= u[4] <= 3500 and u[5] == 0:
+                        phase_currents = [u[4]]
 
-                # Current at offset 16 (0x10): Uint16 in hundredths of an Ampere
-                i_raw = int.from_bytes(payload[16:18], "big")
-                self.last_telemetry.current_a = round(i_raw / 100.0, 2)
+                    if phase_currents:
+                        self.last_telemetry.current_a = round(max(phase_currents) / 100.0, 2)
+                        updated = True
+                    elif all(x == 0 for x in (u[0], u[1], u[2], u[4])):
+                        self.last_telemetry.current_a = 0.0
+                        updated = True
 
-                # Power at offset 18 (0x12): Uint16 in Watts
-                p_raw = int.from_bytes(payload[18:20], "big")
-                self.last_telemetry.power_w = p_raw
-                updated = True
-            except Exception as ex:
-                logger.debug(f"Metrics unpack error: {ex}")
+                    # Power:
+                    # Check u[4], u[5], u[6]
+                    p_cands = [u[4], u[5], u[6]]
+                    if u[6] > 50 and u[6] >= (u[4] + u[5]):
+                        # u[6] is total active power
+                        self.last_telemetry.power_w = u[6]
+                        updated = True
+                    elif u[4] > 50 and u[5] > 50:
+                        # Sum of phase powers
+                        self.last_telemetry.power_w = u[4] + u[5] + u[6]
+                        updated = True
+                    elif max(p_cands) > 50:
+                        self.last_telemetry.power_w = max(p_cands)
+                        updated = True
+                    elif all(x == 0 for x in p_cands):
+                        # Both direct power and phase powers are 0
+                        # Derive power from current and voltage if current is flowing
+                        if self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5:
+                            v = self.last_telemetry.voltage_v or 230.0
+                            n_phases = len(phase_currents) if phase_currents else 3
+                            v_phase = (v / 1.73205) if v > 300 else v
+                            if phase_currents:
+                                derived_w = round(v_phase * sum(x / 100.0 for x in phase_currents))
+                            else:
+                                derived_w = round(v_phase * n_phases * self.last_telemetry.current_a)
+                            self.last_telemetry.power_w = derived_w
+                            updated = True
+                        else:
+                            self.last_telemetry.power_w = 0
+                            updated = True
+
+                    # Reverse derivation: if power > 50 but current was 0
+                    if self.last_telemetry.power_w and self.last_telemetry.power_w > 50:
+                        if not self.last_telemetry.current_a or self.last_telemetry.current_a <= 0.0:
+                            v = self.last_telemetry.voltage_v or 230.0
+                            v_phase = (v / 1.73205) if v > 300 else v
+                            if v > 300:
+                                self.last_telemetry.current_a = round(self.last_telemetry.power_w / (v_phase * 3.0), 2)
+                            else:
+                                self.last_telemetry.current_a = round(self.last_telemetry.power_w / v_phase, 2)
+                            updated = True
+
+                except Exception as ex:
+                    logger.debug(f"Metrics unpack error: {ex}")
 
         # 2. Current Limit: Tag 0xC20A in centi-Amperes (e.g. 0x0258 = 600 -> 6A, 0x0320 = 800 -> 8A, 0x03E8 = 1000 -> 10A)
         c20a_idx = payload.find(b"\xc2\x0a")
@@ -539,16 +593,27 @@ class InateckFragmentManager:
             self.last_telemetry.total_energy_kwh = round(val_raw / 100.0, 2)
             updated = True
 
-        # Cable state: Tag 0xC30A (01 00 = unplugged / standby)
-        c_idx = payload.find(b"\xc3\x0a\x01")
-        if c_idx != -1 and c_idx + 3 < len(payload):
-            val = payload[c_idx + 2 : c_idx + 4]
-            if val == b"\x01\x00":
-                self.last_telemetry.cable_status = "Nicht verbunden (Standby)"
-            elif val == b"\x01\x01":
-                self.last_telemetry.cable_status = "Verbunden (Warten)"
-            elif val == b"\x01\x02":
-                self.last_telemetry.cable_status = "Lädt aktiv"
+        # Cable state: Tag 0xC30A (0 = unplugged/standby, 1 = plugged/waiting, 2 = charging, 3 = paused/done, 4 = fault)
+        c_idx = payload.find(b"\xc3\x0a")
+        if c_idx != -1 and c_idx + 2 < len(payload):
+            tag_len = payload[c_idx + 2]
+            if tag_len >= 1 and c_idx + 3 < len(payload):
+                status_code = payload[c_idx + 3]
+                status_map = {
+                    0x00: "Nicht verbunden (Standby)",
+                    0x01: "Verbunden (Warten)",
+                    0x02: "Lädt aktiv",
+                    0x03: "Verbunden (Pausiert/Fertig)",
+                    0x04: "Fehler",
+                }
+                if status_code in status_map:
+                    self.last_telemetry.cable_status = status_map[status_code]
+                    updated = True
+
+        # Physical override: If current is flowing (> 0.5 A) or active power is high (> 50 W),
+        # the EV cable is physically plugged in and charging regardless of what status tag reported.
+        if (self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5) or (self.last_telemetry.power_w and self.last_telemetry.power_w > 50):
+            self.last_telemetry.cable_status = "Lädt aktiv"
             updated = True
 
         # Charging mode: Tag 0xC314 (0 = Immediate, 1 = Scheduled, 2 = PV)
