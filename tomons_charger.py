@@ -451,6 +451,10 @@ class InateckFragmentManager:
                     data = json.load(f)
                     if "max_current_a" in data and data["max_current_a"]:
                         self.last_telemetry.max_current_a = int(data["max_current_a"])
+                    if "total_energy_kwh" in data and data["total_energy_kwh"]:
+                        self.last_telemetry.total_energy_kwh = float(data["total_energy_kwh"])
+                    if "hardware_session_energy_kwh" in data and data["hardware_session_energy_kwh"]:
+                        self.last_telemetry.hardware_session_energy_kwh = float(data["hardware_session_energy_kwh"])
         except Exception:
             pass
 
@@ -459,7 +463,11 @@ class InateckFragmentManager:
             return
         try:
             with open(self._cache_file, "w") as f:
-                json.dump({"max_current_a": self.last_telemetry.max_current_a}, f)
+                json.dump({
+                    "max_current_a": self.last_telemetry.max_current_a,
+                    "total_energy_kwh": self.last_telemetry.total_energy_kwh,
+                    "hardware_session_energy_kwh": self.last_telemetry.hardware_session_energy_kwh,
+                }, f)
         except Exception:
             pass
 
@@ -525,6 +533,7 @@ class InateckFragmentManager:
                     e_raw = int.from_bytes(payload[data_start + 12 : data_start + 14], "big")
                     if 0 < e_raw < 35000:
                         self.last_telemetry.hardware_session_energy_kwh = round(e_raw / 1000.0, 2)
+                        self._save_cached_state()
 
                     # State evaluations:
                     is_active = (state_raw == 0x0400 or (state_raw >> 8) == 0x04 or (p_raw > 100 and i_raw > 100))
@@ -567,8 +576,10 @@ class InateckFragmentManager:
         e_idx = payload.find(b"\xc2\x10\x05")
         if e_idx != -1 and e_idx + 7 < len(payload):
             val_raw = int.from_bytes(payload[e_idx + 3 : e_idx + 8], "big")
-            self.last_telemetry.total_energy_kwh = round(val_raw / 100.0, 2)
-            updated = True
+            if val_raw > 0:
+                self.last_telemetry.total_energy_kwh = round(val_raw / 100.0, 2)
+                self._save_cached_state()
+                updated = True
 
         # Cable state: Tag 0xC30A (0 = unplugged/standby, 1 = plugged/waiting, 2 = charging, 3 = paused/done, 4 = fault)
         c_idx = payload.find(b"\xc3\x0a")
