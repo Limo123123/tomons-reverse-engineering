@@ -395,7 +395,7 @@ class ChargerTelemetry:
     session_duration_s: Optional[int] = None   # Charging duration timer in seconds
     charge_mode: str = "Sofortladen"           # Charging mode (Sofortladen, etc.)
     cable_status: str = "Nicht verbunden (Standby)"  # Cable status
-    is_online: bool = True
+    is_online: bool = False
     session_id: int = 0
     timestamp: float = field(default_factory=time.time)
     raw_tags: Dict[int, Any] = field(default_factory=dict)
