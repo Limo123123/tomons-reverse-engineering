@@ -392,6 +392,7 @@ class ChargerTelemetry:
     max_current_a: Optional[int] = 16          # Configured max current limit in A (default 16A)
     total_energy_kwh: Optional[float] = 0.0    # Cumulative total energy in kWh
     hardware_session_energy_kwh: Optional[float] = None  # Metered session energy in kWh
+    session_duration_s: Optional[int] = None   # Charging duration timer in seconds
     charge_mode: str = "Sofortladen"           # Charging mode (Sofortladen, etc.)
     cable_status: str = "Nicht verbunden (Standby)"  # Cable status
     is_online: bool = True
@@ -481,13 +482,13 @@ class InateckFragmentManager:
         # 1. Electrical Metrics Tag 0xC302 (Voltage, Current, Power, Session Data)
         # Format: c3 02 [length >= 0x0e]
         # Data contains 7 uint16 words (14 bytes):
-        # Word 0: Reserved (0x0000)
-        # Word 1: Session Duration / Timer (in seconds)
-        # Word 2: Reserved (0x0000)
-        # Word 3: Grid / Line Voltage (in 0.1 V, e.g. 3791 = 379.1 V, 2300 = 230.0 V)
-        # Word 4: Active Charging Current (in 0.01 A, e.g. 0 = 0.00 A, 1600 = 16.00 A)
-        # Word 5: Active Charging Power (in Watts, e.g. 0 = 0 W, 11000 = 11000 W)
-        # Word 6: Hardware-Metered Session Energy (uint16 little-endian, in 0.01 kWh, e.g. 0x0019 = 25 -> 0.25 kWh)
+        # Word 0: Work State / Charging Flag (0x0400 = Charging, 0x0000 = Standby)
+        # Word 1: Session Duration / Timer (in seconds, e.g. 1437 s = 23m 57s)
+        # Word 2: Active Charging Power (in Watts, e.g. 5425 = 5.43 kW)
+        # Word 3: Grid / Line Voltage (in 0.1 V, e.g. 3848 = 384.8 V)
+        # Word 4: Active Charging Current (in 0.01 A, e.g. 861 = 8.61 A)
+        # Word 5: Reserved (0x0000)
+        # Word 6: Session Energy Meter (in Wh, uint16 big-endian, e.g. 2149 Wh = 2.15 kWh)
         m_idx = payload.find(b"\xc3\x02")
         if m_idx != -1 and m_idx + 2 < len(payload):
             tag_len = payload[m_idx + 2]
@@ -495,43 +496,51 @@ class InateckFragmentManager:
                 try:
                     data_start = m_idx + 3
 
-                    # Word 3: Grid / Supply Voltage
+                    # Word 0: Work State
+                    state_raw = int.from_bytes(payload[data_start : data_start + 2], "big")
+
+                    # Word 1: Session Duration Timer (s)
+                    timer_raw = int.from_bytes(payload[data_start + 2 : data_start + 4], "big")
+                    self.last_telemetry.session_duration_s = timer_raw
+
+                    # Word 2: Active Power (W)
+                    p_raw = int.from_bytes(payload[data_start + 4 : data_start + 6], "big")
+                    if 0 <= p_raw <= 35000:
+                        self.last_telemetry.power_w = p_raw
+                        updated = True
+
+                    # Word 3: Grid / Supply Voltage (0.1 V)
                     v_raw = int.from_bytes(payload[data_start + 6 : data_start + 8], "big")
                     if 1000 <= v_raw <= 5000:
                         self.last_telemetry.voltage_v = round(v_raw / 10.0, 1)
                         updated = True
 
-                    # Word 4: Active Current (in 0.01 A)
+                    # Word 4: Active Current (0.01 A)
                     i_raw = int.from_bytes(payload[data_start + 8 : data_start + 10], "big")
                     if 0 <= i_raw <= 5000:
                         self.last_telemetry.current_a = round(i_raw / 100.0, 2)
                         updated = True
 
-                    # Word 5: Active Power (in Watts)
-                    p_raw = int.from_bytes(payload[data_start + 10 : data_start + 12], "big")
-                    if 0 <= p_raw <= 35000:
-                        self.last_telemetry.power_w = p_raw
-                        updated = True
+                    # Word 6: Hardware Session Energy (Wh -> kWh)
+                    e_raw = int.from_bytes(payload[data_start + 12 : data_start + 14], "big")
+                    if 0 < e_raw < 35000:
+                        self.last_telemetry.hardware_session_energy_kwh = round(e_raw / 1000.0, 2)
 
-                    # Word 6: Hardware-metered last session energy (uint16 little-endian)
-                    e_raw = int.from_bytes(payload[data_start + 12 : data_start + 14], "little")
-                    if 0 < e_raw < 10000:
-                        self.last_telemetry.hardware_session_energy_kwh = round(e_raw / 100.0, 2)
-
-                    # Physical cross-derivation if charging
-                    if self.last_telemetry.current_a and self.last_telemetry.current_a > 0.5 and self.last_telemetry.power_w == 0:
-                        v = self.last_telemetry.voltage_v or 230.0
-                        v_phase = (v / 1.73205) if v > 300 else v
-                        n_phases = 3 if v > 300 else 1
-                        self.last_telemetry.power_w = round(v_phase * n_phases * self.last_telemetry.current_a)
-                        updated = True
-
-                    if self.last_telemetry.power_w and self.last_telemetry.power_w > 50 and (not self.last_telemetry.current_a or self.last_telemetry.current_a <= 0.0):
-                        v = self.last_telemetry.voltage_v or 230.0
-                        v_phase = (v / 1.73205) if v > 300 else v
-                        n_phases = 3 if v > 300 else 1
-                        self.last_telemetry.current_a = round(self.last_telemetry.power_w / (v_phase * n_phases), 2)
-                        updated = True
+                    # State evaluations:
+                    is_active = (state_raw == 0x0400 or (state_raw >> 8) == 0x04 or (p_raw > 100 and i_raw > 100))
+                    if is_active:
+                        self.last_telemetry.cable_status = "Lädt aktiv"
+                        # Dynamic gear detection from live current draw (e.g. 8.61 A -> 10 A gear)
+                        cur = self.last_telemetry.current_a
+                        for gear in (6, 8, 10, 13, 16, 20, 24, 32):
+                            if (gear - 1.8) <= cur <= (gear + 0.5):
+                                if self.last_telemetry.max_current_a != gear:
+                                    self.last_telemetry.max_current_a = gear
+                                    self._save_cached_state()
+                                break
+                    elif state_raw == 0:
+                        self.last_telemetry.power_w = 0
+                        self.last_telemetry.current_a = 0.0
 
                 except Exception as ex:
                     logger.debug(f"Metrics unpack error: {ex}")
